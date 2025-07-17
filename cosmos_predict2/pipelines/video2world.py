@@ -154,6 +154,7 @@ def read_and_process_video(
     num_video_frames: int,
     num_latent_conditional_frames: int = 2,
     resize: bool = True,
+    n_views: int = 1,
 ):
     """
     Reads a video, processes it for model input.
@@ -193,7 +194,7 @@ def read_and_process_video(
     video_tensor = torch.from_numpy(video_frames).float() / 255.0  # Convert to [0, 1] range
     video_tensor = video_tensor.permute(3, 0, 1, 2)  # (T, H, W, C) -> (C, T, H, W)
 
-    available_frames = video_tensor.shape[1]
+    available_frames_per_view = video_tensor.shape[1] // n_views
 
     # Calculate how many frames to extract from input video
     frames_to_extract = 4 * (num_latent_conditional_frames - 1) + 1
@@ -203,20 +204,20 @@ def read_and_process_video(
     if num_latent_conditional_frames not in [1, 2]:
         raise ValueError(f"num_latent_conditional_frames must be 1 or 2, but got {num_latent_conditional_frames}")
 
-    if available_frames < frames_to_extract:
+    if available_frames_per_view < frames_to_extract:
         raise ValueError(
-            f"Video has only {available_frames} frames but needs at least {frames_to_extract} frames for num_latent_conditional_frames={num_latent_conditional_frames}"
+            f"Video has only {available_frames_per_view} frames per view but needs at least {frames_to_extract} frames for num_latent_conditional_frames={num_latent_conditional_frames}"
         )
 
-    # Extract the last frames_to_extract from input video
-    start_idx = available_frames - frames_to_extract
-    extracted_frames = video_tensor[:, start_idx:, :, :]  # (C, frames_to_extract, H, W)
 
-    # Convert to (frames_to_extract, C, H, W) for resize
-    extracted_frames = extracted_frames.permute(1, 0, 2, 3)  # (frames_to_extract, C, H, W)
+    # Extract the last frames_to_extract from each input video view
+    video_tensor = rearrange(video_tensor, "c (v t) h w -> c v t h w", v=n_views)
+    start_idx = available_frames_per_view - frames_to_extract
+    extracted_frames = video_tensor[:, :, start_idx:, :, :]  # (C, V, frames_to_extract, H, W)
+    extracted_frames = rearrange(extracted_frames, "c v t h w -> c (v t) h w") # (C, V*frames_to_extract, H, W)
 
-    # Get last frame for padding
-    last_frame = extracted_frames[-1]  # (C, H, W)
+    # Convert to (V*frames_to_extract, C, H, W) for resize
+    extracted_frames = extracted_frames.permute(1, 0, 2, 3)  # (V*frames_to_extract, C, H, W)
 
     # Resize the extracted frames if needed (more efficient than resizing full tensor later)
     if resize:
@@ -231,11 +232,6 @@ def read_and_process_video(
         extracted_frames = torchvision.transforms.functional.resize(extracted_frames, resizing_shape)
         extracted_frames = torchvision.transforms.functional.center_crop(extracted_frames, resolution)
 
-        # Resize and crop the last frame separately (for padding)
-        last_frame = last_frame.unsqueeze(0)  # Add batch dim for resize
-        last_frame = torchvision.transforms.functional.resize(last_frame, resizing_shape)
-        last_frame = torchvision.transforms.functional.center_crop(last_frame, resolution)
-        last_frame = last_frame.squeeze(0)  # Remove batch dim
 
     # Get final dimensions
     C, H, W = extracted_frames.shape[1], extracted_frames.shape[2], extracted_frames.shape[3]
@@ -247,15 +243,12 @@ def read_and_process_video(
     # Set extracted frames and convert to uint8
     full_video[:frames_to_extract] = (extracted_frames * 255.0).to(torch.uint8)
 
-    # Pad remaining frames with the last frame (already resized if needed)
-    if frames_to_extract < num_video_frames:
-        last_frame_uint8 = (last_frame * 255.0).to(torch.uint8)
-        for i in range(num_video_frames - frames_to_extract):
-            full_video[frames_to_extract + i] = last_frame_uint8
+    assert frames_to_extract * n_views == num_video_frames, f"frames_to_extract * n_views {frames_to_extract * n_views} != num_video_frames {num_video_frames}"
 
     # Add batch dimension and permute in one operation to final format
     # [T, C, H, W] -> [1, C, T, H, W]
     full_video = full_video.unsqueeze(0).permute(0, 2, 1, 3, 4)
+    import pdb; pdb.set_trace()
     return full_video
 
 
@@ -436,12 +429,21 @@ class Video2WorldPipeline(BasePipeline):
         B, C, T, H, W = video.shape
 
         self.batch_size = 1
+        n_views = 7
+        t5_text_embeddings = torch.zeros(self.batch_size, n_views*512, 1024,dtype=self.torch_dtype).to(self.device)
+        t5_text_embeddings[:, 0:512] = self.encode_prompt(prompt).to(dtype=self.torch_dtype).to(self.device)
+        latent_view_indices_T = torch.repeat_interleave(torch.arange(n_views), self.config.state_t)
+        latent_view_indices_B_T = latent_view_indices_T.unsqueeze(0).expand(self.batch_size, -1).to(self.device)
+        
         data_batch = {
+            "sample_n_views": n_views,
+            "latent_view_indices_B_T": latent_view_indices_B_T,
+            "ref_cam_view_idx_sample_position": torch.tensor([-1]).to(self.device),
             "dataset_name": "video_data",
             "video": video,
-            "t5_text_embeddings": self.encode_prompt(prompt).to(dtype=self.torch_dtype),
-            "fps": torch.randint(16, 32, (self.batch_size,)),  # Random FPS (might be used by model)
-            "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
+            "t5_text_embeddings": t5_text_embeddings,
+            "fps": torch.randint(16, 32, (self.batch_size,)).to(self.device),  # Random FPS (might be used by model)
+            "padding_mask": torch.zeros(self.batch_size, 1, H, W).to(self.device),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_latent_conditional_frames,  # Specify number of conditional frames
         }
 
@@ -782,6 +784,7 @@ class Video2WorldPipeline(BasePipeline):
         seed: int = 0,
         use_cuda_graphs: bool = False,
         return_prompt: bool = False,
+        n_views: int = 7,
     ) -> torch.Tensor | None:
         # Parameter check
         width, height = VIDEO_RES_SIZE_INFO[self.config.resolution][aspect_ratio]
@@ -828,7 +831,7 @@ class Video2WorldPipeline(BasePipeline):
         ):
             log.warning("Prompt refinement is disabled")
 
-        num_video_frames = self.tokenizer.get_pixel_num_frames(self.config.state_t)
+        num_video_frames = self.tokenizer.get_pixel_num_frames(self.config.state_t) * n_views
 
         # Detect file extension to determine appropriate reading function
         ext = os.path.splitext(input_path)[1].lower()
@@ -864,7 +867,7 @@ class Video2WorldPipeline(BasePipeline):
         _T, _H, _W = data_batch[input_key].shape[-3:]
         state_shape = [
             self.config.state_ch,
-            self.tokenizer.get_latent_num_frames(_T),
+            self.tokenizer.get_latent_num_frames(_T) * n_views,
             _H // self.tokenizer.spatial_compression_factor,
             _W // self.tokenizer.spatial_compression_factor,
         ]
